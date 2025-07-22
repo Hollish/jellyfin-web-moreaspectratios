@@ -292,6 +292,11 @@ export class HtmlVideoPlayer {
     #currentTime;
 
     /**
+     * @type {ResizeObserver | null | undefined}
+     */
+    #videoResizeObserver;
+
+    /**
      * @private (used in other files)
      * @type {any | undefined}
      */
@@ -869,6 +874,11 @@ export class HtmlVideoPlayer {
             videoElement.removeEventListener('dblclick', this.onDblClick);
             videoElement.removeEventListener('waiting', this.onWaiting);
             videoElement.removeEventListener('error', this.onError); // bound in htmlMediaHelper
+            // Remove video resize observer
+            if (this.#videoResizeObserver) {
+                this.#videoResizeObserver.disconnect();
+                this.#videoResizeObserver = null;
+            }
 
             resetSrc(videoElement);
 
@@ -1064,6 +1074,27 @@ export class HtmlVideoPlayer {
     onWaiting() {
         Events.trigger(this, 'waiting');
     }
+
+    onLoadedMetadata = () => {
+        // Re-apply aspect ratio when video metadata is loaded and dimensions are available
+        try {
+            this.#applyAspectRatio();
+        } catch (error) {
+            console.warn('Error applying aspect ratio on loadedmetadata:', error);
+        }
+    }
+
+    /**
+     * @private
+     */
+    onVideoResize = debounce(() => {
+        // Re-apply aspect ratio when video element resizes to handle container width changes
+        try {
+            this.#applyAspectRatio();
+        } catch (error) {
+            console.warn('Error applying aspect ratio on video resize:', error);
+        }
+    }, 100);
 
     /**
          * @private
@@ -1345,7 +1376,7 @@ export class HtmlVideoPlayer {
      */
     renderPgs(videoElement, track, item) {
         import('libpgs').then((libpgs) => {
-            const aspectRatio = this.getAspectRatio() === 'auto' ? 'contain' : this.getAspectRatio();
+            const aspectRatio = this.getAspectRatio() in ['cover', 'fill'] ? this.getAspectRatio() : 'contain';
             const options = {
                 video: videoElement,
                 subUrl: getTextTrackUrl(track, item),
@@ -1699,9 +1730,14 @@ export class HtmlVideoPlayer {
                 videoElement.addEventListener('click', this.onClick);
                 videoElement.addEventListener('dblclick', this.onDblClick);
                 videoElement.addEventListener('waiting', this.onWaiting);
+                videoElement.addEventListener('loadedmetadata', this.onLoadedMetadata);
                 if (options.backdropUrl) {
                     videoElement.poster = options.backdropUrl;
                 }
+
+                // Add video resize observer for aspect ratio adjustments
+                this.#videoResizeObserver = new ResizeObserver(this.onVideoResize);
+                this.#videoResizeObserver.observe(videoElement);
 
                 document.body.insertBefore(playerDlg, document.body.firstChild);
                 this.#videoDialog = playerDlg;
@@ -1748,6 +1784,19 @@ export class HtmlVideoPlayer {
             if (options.backdropUrl) {
                 // update backdrop image
                 videoElement.poster = options.backdropUrl;
+            }
+            
+            // Add loadedmetadata listener if not already present
+            if (!videoElement.hasAttribute('data-aspect-ratio-listener')) {
+                videoElement.addEventListener('loadedmetadata', this.onLoadedMetadata);
+                videoElement.setAttribute('data-aspect-ratio-listener', 'true');
+            }
+
+            // Add video resize observer if not already present
+            if (!videoElement.hasAttribute('data-resize-observer')) {
+                this.#videoResizeObserver = new ResizeObserver(this.onVideoResize);
+                this.#videoResizeObserver.observe(videoElement);
+                videoElement.setAttribute('data-resize-observer', 'true');
             }
 
             return Promise.resolve(videoElement);
@@ -2113,15 +2162,52 @@ export class HtmlVideoPlayer {
     #applyAspectRatio(val = this.getAspectRatio()) {
         const mediaElement = this.#mediaElement;
         if (mediaElement) {
-            if (val === 'auto') {
-                mediaElement.style.removeProperty('object-fit');
-            } else {
+            const videoRect = mediaElement.getBoundingClientRect();
+            const displayRatio = videoRect.width / videoRect.height;
+            mediaElement.style.removeProperty('transform');
+            mediaElement.style.removeProperty('object-fit');
+
+            // Target aspect ratios for each option
+            const targetAspectRatios = {
+                '239x1': 2.39, // 2.39:1
+                '235x1': 2.35, // 2.35:1
+                '220x1': 2.20, // 2.20:1
+                '185x1': 1.85, // 1.85:1
+                '180x1': 1.80  // 1.80:1
+            };
+            
+            if (Object.keys(targetAspectRatios).includes(val)) {
+                const targetRatio = targetAspectRatios[val];
+                let scaleValue = 1;
+                
+                // Try to calculate dynamic overscan if video metadata is available
+                if (targetRatio && mediaElement.videoWidth && mediaElement.videoHeight) {
+                    const currentRatio = mediaElement.videoWidth / mediaElement.videoHeight;
+                    console.debug(`Video ratio: ${currentRatio}, Display ratio: ${displayRatio}, target ratio: ${targetRatio}`);
+                    
+                    // Only apply overscan if it would actually remove letterboxing
+                    if (currentRatio < targetRatio && displayRatio >= currentRatio) {
+                        // Use the lesser of targetRatio or displayRatio for overscan calculation
+                        const overscanRatio = Math.min(targetRatio, displayRatio);
+                        scaleValue = overscanRatio / currentRatio;
+                        console.debug(`Applying overscan: scaleValue=${scaleValue}`);
+                    }
+                    
+                    // Apply scaling if appropriate
+                    console.debug(`Final scaleValue: ${scaleValue}`);
+                    if (scaleValue > 1.0) {
+                        mediaElement.style.transform = `scale(${scaleValue})`;
+                        mediaElement.style.transformOrigin = 'center center';
+                        console.debug(`Applied transform: scale(${scaleValue})`);
+                    }
+                }
+            } else if (val !== 'auto') {
                 mediaElement.style['object-fit'] = val;
             }
         }
 
         if (this.#currentPgsRenderer) {
-            this.#currentPgsRenderer.aspectRatio = val === 'auto' ? 'contain' : val;
+            this.#currentPgsRenderer.aspectRatio = val in ['cover', 'fill'] ? val : 'contain';
         }
     }
 
@@ -2144,6 +2230,21 @@ export class HtmlVideoPlayer {
         }, {
             name: globalize.translate('AspectRatioFill'),
             id: 'fill'
+        }, {
+            name: '2.39:1 (43:18)',
+            id: '239x1'
+        }, {
+            name: '2.35:1 (47:20)',
+            id: '235x1'
+        }, {
+            name: '2.20:1 (11:5)',
+            id: '220x1'
+        }, {
+            name: '1.85:1 (37:20)',
+            id: '185x1'
+        }, {
+            name: '1.80:1 (9:5)',
+            id: '180x1'
         }];
     }
 
